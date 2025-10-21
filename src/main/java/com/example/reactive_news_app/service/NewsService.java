@@ -3,11 +3,13 @@ package com.example.reactive_news_app.service;
 import com.example.reactive_news_app.model.NewsArticle;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.util.*;
 import java.util.concurrent.ThreadLocalRandom;
 
 @Service
@@ -20,6 +22,147 @@ public class NewsService {
 
     public NewsService() {
         initializeData();
+    }
+
+    /**
+     * 모든 뉴스 조회 (Flux)
+     */
+    public Flux<NewsArticle> getAllNews() {
+        log.info("모든 뉴스 조회 요청");
+
+        return Flux.fromIterable(newsRepository.values())
+                .sort(Comparator.comparing(NewsArticle::getPublishedAt).reversed())
+                .doOnNext(article -> log.debug("뉴스 반환: {}", article.getTitle()))
+                .doOnComplete(() -> log.info("모든 뉴스 조회 완료"));
+    }
+
+    /**
+     * 카테고리별 뉴스 조회
+     */
+    public Flux<NewsArticle> getNewsByCategory(String category) {
+        log.info("카테고리별 뉴스 조회: {}", category);
+
+        return Flux.fromIterable(newsRepository.values())
+                .filter(article -> category.equalsIgnoreCase(article.getCategory()))
+                .sort(Comparator.comparing(NewsArticle::getPublishedAt).reversed())
+                .doOnNext(article -> log.debug("카테고리 [{}] 뉴스: {}", category, article.getTitle()));
+    }
+
+    /**
+     * ID로 뉴스 조회
+     */
+    public Mono<NewsArticle> getNewsById(Long id) {
+        log.info("뉴스 조회 요청: ID={}", id);
+
+        return Mono.fromSupplier(() -> newsRepository.get(id))
+                .switchIfEmpty(Mono.error(new RuntimeException("뉴스를 찾을 수 없습니다: " + id)))
+                .doOnNext(article -> {
+                    // 조회수 증가
+                    article.setViewCount(article.getViewCount() + 1);
+                    log.info("뉴스 조회 완료: {} (조회수: {})", article.getTitle(), article.getViewCount());
+                })
+                .subscribeOn(Schedulers.boundedElastic());
+    }
+
+    /**
+     * 실시간 뉴스 스트림 (Server-Sent Events)
+     */
+    public Flux<NewsArticle> getNewsStream() {
+        log.info("실시간 뉴스 스트림 시작");
+
+        return Flux.interval(Duration.ofSeconds(3))
+                .map(tick -> generateRandomNews())
+                .doOnNext(article -> {
+                    newsRepository.put(article.getId(), article);
+                    log.info("새 뉴스 생성: {}", article.getTitle());
+                })
+                .doOnCancel(() -> log.info("뉴스 스트림 종료"))
+                .onBackpressureBuffer(50); // 백프레셔 처리
+    }
+
+    /**
+     * 사용자 관심사에 맞는 뉴스 필터링
+     */
+    public Flux<NewsArticle> getPersonalizedNews(List<String> preferredCategories) {
+        log.info("개인화 뉴스 조회: 선호 카테고리={}", preferredCategories);
+
+        return getAllNews()
+                .filter(article -> preferredCategories.contains(article.getCategory()))
+                .take(10) // 최대 10개
+                .doOnNext(article -> log.debug("개인화 뉴스: {}", article.getTitle()));
+    }
+
+    /**
+     * 뉴스 검색
+     */
+    public Flux<NewsArticle> searchNews(String keyword) {
+        log.info("뉴스 검색: 키워드={}", keyword);
+
+        return Flux.fromIterable(newsRepository.values())
+                .filter(article ->
+                        article.getTitle().toLowerCase().contains(keyword.toLowerCase()) ||
+                                article.getContent().toLowerCase().contains(keyword.toLowerCase())
+                )
+                .sort(Comparator.comparing(NewsArticle::getPublishedAt).reversed())
+                .doOnNext(article -> log.debug("검색 결과: {}", article.getTitle()));
+    }
+
+    /**
+     * 뉴스 생성 (Mono. 하나씩)
+     */
+    public Mono<NewsArticle> createNews(NewsArticle newsArticle) {
+        log.info("새 뉴스 생성 요청: {}", newsArticle.getTitle());
+
+        // fromSupplier: 비동기로 실행(쓰레드)
+        return Mono.fromSupplier(() -> {
+            Long id = System.currentTimeMillis();
+            newsArticle.setId(id);
+            newsArticle.setPublishedAt(LocalDateTime.now());
+            newsArticle.setViewCount(0);
+
+            newsRepository.put(id, newsArticle);
+
+            log.info("뉴스 생성 완료: ID={}", id);
+            return newsArticle;
+        }).subscribeOn(Schedulers.boundedElastic());    // DB CRUD
+    }
+
+    /**
+     * 인기 뉴스 조회 (조회수 기준)
+     */
+    public Flux<NewsArticle> getPopularNews(int limit) {
+        log.info("인기 뉴스 조회: 상위 {}개", limit);
+
+        return Flux.fromIterable(newsRepository.values())
+                .sort(Comparator.comparing(NewsArticle::getViewCount).reversed())
+                .take(limit)
+                .doOnNext(article -> log.debug("인기 뉴스: {} (조회수: {})",
+                        article.getTitle(), article.getViewCount()));
+    }
+
+    /**
+     * 랜덤 뉴스 생성 (스트림용)
+     */
+    private NewsArticle generateRandomNews() {
+        ThreadLocalRandom random = ThreadLocalRandom.current();
+        String category = categories.get(random.nextInt(categories.size()));
+        String author = authors.get(random.nextInt(authors.size()));
+
+        String title = String.format("[%s] %s의 새로운 소식 %d",
+                category, author, System.currentTimeMillis() % 1000);
+
+        String content = String.format("%s 카테고리의 상세한 뉴스 내용입니다. " +
+                "이 뉴스는 %s 기자가 작성했습니다.", category, author);
+
+        return NewsArticle.builder()
+                .id(System.currentTimeMillis())
+                .title(title)
+                .content(content)
+                .category(category)
+                .author(author)
+                .publishedAt(LocalDateTime.now())
+                .viewCount(0)
+                .build();
     }
 
     /**
